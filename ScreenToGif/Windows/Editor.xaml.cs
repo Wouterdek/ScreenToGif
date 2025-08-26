@@ -212,7 +212,7 @@ namespace ScreenToGif.Windows
 
         private Action<object, RoutedEventArgs> _applyAction = null;
 
-        private bool _abortLoading;
+        private CancellationTokenSource _loadingCancelTokenSource = new();
 
         /// <summary>
         /// Lock used to prevent firing multiple times (at the same time) both the Activated/Deactivated events.
@@ -3256,7 +3256,7 @@ namespace ScreenToGif.Windows
 
         private void CancelLoadingButton_Click(object sender, RoutedEventArgs e)
         {
-            _abortLoading = true;
+            _loadingCancelTokenSource.Cancel();
             CancelLoadingButton.IsEnabled = false;
         }
 
@@ -3418,7 +3418,7 @@ namespace ScreenToGif.Windows
                             {
                                 var frame = Project.Frames[index];
 
-                                if (_abortLoading)
+                                if (_loadingCancelTokenSource.IsCancellationRequested)
                                     return false;
 
                                 Dispatcher.Invoke(() => { UpdateProgress(number++); });
@@ -3472,7 +3472,7 @@ namespace ScreenToGif.Windows
 
                 foreach (var frame in Project.Frames)
                 {
-                    if (_abortLoading)
+                    if (_loadingCancelTokenSource.IsCancellationRequested)
                         break;
 
                     if (!File.Exists(frame.Path))
@@ -3481,7 +3481,7 @@ namespace ScreenToGif.Windows
                     UpdateProgress(processedFrame++);
                 }
 
-                if (_abortLoading)
+                if (_loadingCancelTokenSource.IsCancellationRequested)
                     return false;
 
                 //Remove the corrupted frames.
@@ -3532,7 +3532,7 @@ namespace ScreenToGif.Windows
 
                         foreach (var task in tasks)
                         {
-                            if (_abortLoading)
+                            if (_loadingCancelTokenSource.IsCancellationRequested)
                             {
                                 Dispatcher.Invoke(() =>
                                 {
@@ -3625,7 +3625,7 @@ namespace ScreenToGif.Windows
 
                 foreach (var frame in Project.Frames)
                 {
-                    if (_abortLoading)
+                    if (_loadingCancelTokenSource.IsCancellationRequested)
                         break;
 
                     frame.Index = count++;
@@ -3645,7 +3645,7 @@ namespace ScreenToGif.Windows
                     });
                 }
 
-                if (_abortLoading)
+                if (_loadingCancelTokenSource.IsCancellationRequested)
                     return false;
 
                 if (corruptedList.Any())
@@ -3670,7 +3670,7 @@ namespace ScreenToGif.Windows
             }
             finally
             {
-                _abortLoading = false;
+                _loadingCancelTokenSource = new CancellationTokenSource();
             }
         }
 
@@ -5456,17 +5456,10 @@ namespace ScreenToGif.Windows
 
             Dispatcher.Invoke(() => IsLoading = true);
 
-            var count = 0;
-            foreach (var frame in Project.Frames)
+            EditFramesInParallel(Project.Frames, (frameInfo, image) =>
             {
-                var png = new PngBitmapEncoder();
-                png.Frames.Add(ImageMethods.ResizeImage((BitmapImage)frame.Path.SourceFrom(), width, height, 0, dpi, scalingQuality));
-
-                using (Stream stm = File.OpenWrite(frame.Path))
-                    png.Save(stm);
-
-                UpdateProgress(count++);
-            }
+                return ImageMethods.ResizeImage((BitmapImage)image, width, height, 0, dpi, scalingQuality);
+            });
         }
 
         private void Crop(Int32Rect rect)
@@ -5475,17 +5468,10 @@ namespace ScreenToGif.Windows
 
             Dispatcher.Invoke(() => IsLoading = true);
 
-            var count = 0;
-            foreach (var frame in Project.Frames)
+            EditFramesInParallel(Project.Frames, frame =>
             {
-                var png = new PngBitmapEncoder();
-                png.Frames.Add(BitmapFrame.Create(frame.Path.CropFrom(rect)));
-
-                using (Stream stm = File.OpenWrite(frame.Path))
-                    png.Save(stm);
-
-                UpdateProgress(count++);
-            }
+                return frame.Path.CropFrom(rect);
+            });
         }
 
         private void ProgressAsync(ProgressViewModel model)
@@ -5501,99 +5487,86 @@ namespace ScreenToGif.Windows
             var thickness = model.Thickness * ZoomBoxControl.ScaleDiff;
             var fontSize = model.FontSize * ZoomBoxControl.ScaleDiff;
 
-            var count = 1;
-            var cumulative = 0L;
-
-            foreach (var frame in Project.Frames)
+            var delayPrefixSum = new List<long>(Project.Frames.Count);
+            delayPrefixSum.Add(0);
+            for (int i = 1; i < Project.Frames.Count; ++i)
             {
-                if (_abortLoading)
-                    return;
+                delayPrefixSum.Add(delayPrefixSum[i - 1] + Project.Frames[i].Delay);
+            }
 
-                var image = frame.Path.SourceFrom();
+            EditFramesInParallel(Project.Frames, (frame, drawingContext, image) =>
+            {
+                drawingContext.DrawImage(image, new Rect(0, 0, image.Width, image.Height));
 
-                var drawingVisual = new DrawingVisual();
-                using (var drawingContext = drawingVisual.RenderOpen())
+                var count = frame.Index + 1;
+                var cumulative = delayPrefixSum[frame.Index];
+
+                //TODO: Test with high dpi.
+                if (model.Type == ProgressTypes.Bar)
                 {
-                    drawingContext.DrawImage(image, new Rect(0, 0, image.Width, image.Height));
+                    #region Bar
 
-                    //TODO: Test with high dpi.
-                    if (model.Type == ProgressTypes.Bar)
+                    if (model.Orientation == Orientation.Horizontal)
                     {
-                        #region Bar
-
-                        if (model.Orientation == Orientation.Horizontal)
-                        {
-                            //Width changes (Current/Total * Available size), Height is thickness.
-                            var width = count / (double)Project.Frames.Count * image.Width; //* image.Width instead?
-                            var left = model.HorizontalAlignment == HorizontalAlignment.Left ? 0 :
-                                model.HorizontalAlignment == HorizontalAlignment.Right ? image.Width - width :
-                                (image.Width - width) / 2d;
-                            var top = model.VerticalAlignment == VerticalAlignment.Top ? 0 :
-                                model.VerticalAlignment == VerticalAlignment.Bottom ? image.Height - thickness :
-                                (image.Height - thickness) / 2d;
-
-                            drawingContext.DrawRectangle(new SolidColorBrush(model.Color), null, new Rect(Math.Round(left, 0), Math.Round(top, 0), Math.Round(width, 0), thickness));
-                        }
-                        else
-                        {
-                            //Height changes (Current/Total * Available size), Width is thickness.
-                            var height = count / (double)Project.Frames.Count * image.Height;
-                            var left = model.HorizontalAlignment == HorizontalAlignment.Left ? 0 :
-                                model.HorizontalAlignment == HorizontalAlignment.Right ? image.Width - thickness :
-                                (image.Width - thickness) / 2d;
-                            var top = model.VerticalAlignment == VerticalAlignment.Top ? 0 :
-                                model.VerticalAlignment == VerticalAlignment.Bottom ? image.Height - height :
-                                (image.Height - height) / 2d;
-
-                            drawingContext.DrawRectangle(new SolidColorBrush(model.Color), null, new Rect(Math.Round(left, 0), Math.Round(top, 0), thickness, Math.Round(height, 0)));
-                        }
-
-                        #endregion
-                    }
-                    else
-                    {
-                        #region Text
-
-                        if (count > 0)
-                            cumulative += Project.Frames[count - 1].Delay;
-
-                        //Calculate size.
-                        var text = GetProgressText(model.Precision, model.ShowTotal, model.Format, model.DateFormat, model.StartNumber, cumulative, total, count); //FrameListView.SelectedIndex
-                        var formatted = new FormattedText(text, CultureInfo.CurrentUICulture, FlowDirection.LeftToRight,
-                            new Typeface(model.FontFamily, model.FontStyle, model.FontWeight, default), fontSize, new SolidColorBrush(model.FontColor),
-                            null, TextFormattingMode.Ideal);
-
-                        var width = formatted.Width + 4; //2px padding for both sides.
-                        var height = formatted.Height;
+                        //Width changes (Current/Total * Available size), Height is thickness.
+                        var width = count / (double)Project.Frames.Count * image.Width; //* image.Width instead?
                         var left = model.HorizontalAlignment == HorizontalAlignment.Left ? 0 :
                             model.HorizontalAlignment == HorizontalAlignment.Right ? image.Width - width :
                             (image.Width - width) / 2d;
                         var top = model.VerticalAlignment == VerticalAlignment.Top ? 0 :
+                            model.VerticalAlignment == VerticalAlignment.Bottom ? image.Height - thickness :
+                            (image.Height - thickness) / 2d;
+
+                        drawingContext.DrawRectangle(new SolidColorBrush(model.Color), null, new Rect(Math.Round(left, 0), Math.Round(top, 0), Math.Round(width, 0), thickness));
+                    }
+                    else
+                    {
+                        //Height changes (Current/Total * Available size), Width is thickness.
+                        var height = count / (double)Project.Frames.Count * image.Height;
+                        var left = model.HorizontalAlignment == HorizontalAlignment.Left ? 0 :
+                            model.HorizontalAlignment == HorizontalAlignment.Right ? image.Width - thickness :
+                            (image.Width - thickness) / 2d;
+                        var top = model.VerticalAlignment == VerticalAlignment.Top ? 0 :
                             model.VerticalAlignment == VerticalAlignment.Bottom ? image.Height - height :
                             (image.Height - height) / 2d;
 
-                        //Draw background rectangle and the text.
-                        drawingContext.DrawRectangle(new SolidColorBrush(model.Color), null, new Rect(Math.Round(left, 0), Math.Round(top, 0), Math.Round(width, 0), Math.Round(height, 0)));
-                        drawingContext.DrawText(formatted, new Point(Math.Round(left + 2, 0), Math.Round(top, 0)));
-
-                        #endregion
+                        drawingContext.DrawRectangle(new SolidColorBrush(model.Color), null, new Rect(Math.Round(left, 0), Math.Round(top, 0), thickness, Math.Round(height, 0)));
                     }
+
+                    #endregion
+                }
+                else
+                {
+                    #region Text
+
+                    if (count > 0)
+                        cumulative += Project.Frames[count - 1].Delay;
+
+                    //Calculate size.
+                    var text = GetProgressText(model.Precision, model.ShowTotal, model.Format, model.DateFormat, model.StartNumber, cumulative, total, count); //FrameListView.SelectedIndex
+                    var formatted = new FormattedText(text, CultureInfo.CurrentUICulture, FlowDirection.LeftToRight,
+                        new Typeface(model.FontFamily, model.FontStyle, model.FontWeight, default), fontSize, new SolidColorBrush(model.FontColor),
+                        null, TextFormattingMode.Ideal);
+
+                    var width = formatted.Width + 4; //2px padding for both sides.
+                    var height = formatted.Height;
+                    var left = model.HorizontalAlignment == HorizontalAlignment.Left ? 0 :
+                        model.HorizontalAlignment == HorizontalAlignment.Right ? image.Width - width :
+                        (image.Width - width) / 2d;
+                    var top = model.VerticalAlignment == VerticalAlignment.Top ? 0 :
+                        model.VerticalAlignment == VerticalAlignment.Bottom ? image.Height - height :
+                        (image.Height - height) / 2d;
+
+                    //Draw background rectangle and the text.
+                    drawingContext.DrawRectangle(new SolidColorBrush(model.Color), null, new Rect(Math.Round(left, 0), Math.Round(top, 0), Math.Round(width, 0), Math.Round(height, 0)));
+                    drawingContext.DrawText(formatted, new Point(Math.Round(left + 2, 0), Math.Round(top, 0)));
+
+                    #endregion
                 }
 
-                //Converts the Visual (DrawingVisual) into a BitmapSource.
-                var bmp = new RenderTargetBitmap(image.PixelWidth, image.PixelHeight, image.DpiX, image.DpiY, PixelFormats.Pbgra32);
-                bmp.Render(drawingVisual);
-
-                //Creates a PngBitmapEncoder and adds the BitmapSource to the frames of the encoder.
-                var encoder = new PngBitmapEncoder();
-                encoder.Frames.Add(BitmapFrame.Create(bmp));
-
-                //Saves the image into a file using the encoder.
-                using (Stream stream = File.Create(frame.Path))
-                    encoder.Save(stream);
-
-                UpdateProgress((count++) - 1);
-            }
+                bool wasModified = true;
+                return wasModified;
+            });
         }
 
         private List<int> OverlayAsync(RenderTargetBitmap render, bool forAll = false)
@@ -5608,32 +5581,14 @@ namespace ScreenToGif.Windows
 
             ShowProgress(LocalizationHelper.Get("S.Editor.ApplyingOverlay"), frameList.Count);
 
-            var count = 0;
-            foreach (var frame in frameList)
+            EditFramesInParallel(frameList, (frame, drawingContext, image) =>
             {
-                var image = frame.Path.SourceFrom();
+                drawingContext.DrawImage(image, new Rect(0, 0, image.Width, image.Height));
+                drawingContext.DrawImage(render, new Rect(0, 0, render.Width, render.Height));
 
-                var drawingVisual = new DrawingVisual();
-                using (var drawingContext = drawingVisual.RenderOpen())
-                {
-                    drawingContext.DrawImage(image, new Rect(0, 0, image.Width, image.Height));
-                    drawingContext.DrawImage(render, new Rect(0, 0, render.Width, render.Height));
-                }
-
-                //Converts the Visual (DrawingVisual) into a BitmapSource.
-                var bmp = new RenderTargetBitmap(image.PixelWidth, image.PixelHeight, image.DpiX, image.DpiY, PixelFormats.Pbgra32);
-                bmp.Render(drawingVisual);
-
-                //Creates a PngBitmapEncoder and adds the BitmapSource to the frames of the encoder.
-                var encoder = new PngBitmapEncoder();
-                encoder.Frames.Add(BitmapFrame.Create(bmp));
-
-                //Saves the image into a file using the encoder.
-                using (Stream stream = File.Create(frame.Path))
-                    encoder.Save(stream);
-
-                UpdateProgress(count++);
-            }
+                bool wasModified = true;
+                return wasModified;
+            });
 
             return selectedList;
         }
@@ -5752,25 +5707,13 @@ namespace ScreenToGif.Windows
 
             #endregion
 
-            //Pen used for drawing the outline of the text shape.
-            var pen = new Pen(new SolidColorBrush(model.KeyStrokesOutlineColor), model.KeyStrokesOutlineThickness)
+            EditFramesInParallel(auxList, (frame, drawingContext, image) =>
             {
-                DashCap = PenLineCap.Round,
-                EndLineCap = PenLineCap.Round,
-                LineJoin = PenLineJoin.Round,
-                StartLineCap = PenLineCap.Round
-            };
-
-            var count = 0;
-            foreach (var frame in auxList)
-            {
-                if (_abortLoading)
-                    return;
+                bool wasModified = false;
 
                 if (!frame.KeyList.Any())
                 {
-                    UpdateProgress(count++);
-                    continue;
+                    return wasModified;
                 }
 
                 #region Removes any duplicated modifier key
@@ -5815,8 +5758,7 @@ namespace ScreenToGif.Windows
 
                 if (keyList.Count == 0)
                 {
-                    UpdateProgress(count++);
-                    continue;
+                    return wasModified;
                 }
 
                 #endregion
@@ -5827,27 +5769,32 @@ namespace ScreenToGif.Windows
 
                 if (string.IsNullOrEmpty(text))
                 {
-                    UpdateProgress(count++);
-                    continue;
+                    return wasModified;
                 }
 
                 #endregion
-
-                var image = frame.Path.SourceFrom();
 
                 #region Check if margins and paddings are set properly
 
                 if (image.Width - (model.KeyStrokesPadding + model.KeyStrokesMargin) * 2 <= 0 || image.Height - (model.KeyStrokesPadding + model.KeyStrokesMargin) * 2 <= 0)
                 {
-                    UpdateProgress(count++);
-                    continue;
+                    return wasModified;
                 }
 
                 #endregion
 
-                var drawingVisual = new DrawingVisual();
-                using (var drawingContext = drawingVisual.RenderOpen())
+                //Pen used for drawing the outline of the text shape.
+                var pen = new Pen(new SolidColorBrush(model.KeyStrokesOutlineColor), model.KeyStrokesOutlineThickness)
                 {
+                    DashCap = PenLineCap.Round,
+                    EndLineCap = PenLineCap.Round,
+                    LineJoin = PenLineJoin.Round,
+                    StartLineCap = PenLineCap.Round
+                };
+
+                {
+                    wasModified = true;
+
                     //The FormattedText class helps in transforming the text to a shape.
                     var formatted = new FormattedText(text, CultureInfo.CurrentUICulture, FlowDirection.LeftToRight,
                         new Typeface(model.KeyStrokesFontFamily, model.KeyStrokesFontStyle, model.KeyStrokesFontWeight, default), model.KeyStrokesFontSize,
@@ -5909,23 +5856,8 @@ namespace ScreenToGif.Windows
                         drawingContext.DrawGeometry(new SolidColorBrush(model.KeyStrokesFontColor), pen, geometry);
                 }
 
-                //Converts the Visual (DrawingVisual) into a BitmapSource.
-                var bmp = new RenderTargetBitmap(image.PixelWidth, image.PixelHeight, image.DpiX, image.DpiY, PixelFormats.Pbgra32);
-                bmp.Render(drawingVisual);
-
-                //Creates a PngBitmapEncoder and adds the BitmapSource to the frames of the encoder.
-                var encoder = new PngBitmapEncoder();
-                encoder.Frames.Add(BitmapFrame.Create(bmp));
-
-                //Saves the image into a file using the encoder.
-                using (Stream stream = File.Create(frame.Path))
-                    encoder.Save(stream);
-
-                GC.WaitForPendingFinalizers();
-                GC.Collect(1);
-
-                UpdateProgress(count++);
-            }
+                return wasModified;
+            });
         }
 
         private void BorderAsync(BorderViewModel model)
@@ -5947,13 +5879,8 @@ namespace ScreenToGif.Windows
             var rightThick = model.RightThickness * ZoomBoxControl.ScaleDiff;
             var bottomThick = model.BottomThickness * ZoomBoxControl.ScaleDiff;
 
-            var count = 0;
-            foreach (var frame in frames)
+            EditFramesInParallel(Project.Frames, (frameInfo, image) =>
             {
-                if (_abortLoading)
-                    return;
-
-                var image = frame.Path.SourceFrom();
                 var drawingVisual = new DrawingVisual();
 
                 using (var drawingContext = drawingVisual.RenderOpen())
@@ -6011,16 +5938,8 @@ namespace ScreenToGif.Windows
                 var bmp = new RenderTargetBitmap(frameWidth, frameHeight, image.DpiX, image.DpiY, PixelFormats.Pbgra32);
                 bmp.Render(drawingVisual);
 
-                //Creates a PngBitmapEncoder and adds the BitmapSource to the frames of the encoder.
-                var encoder = new PngBitmapEncoder();
-                encoder.Frames.Add(BitmapFrame.Create(bmp));
-
-                //Saves the image into a file using the encoder.
-                using (Stream stream = File.Create(frame.Path))
-                    encoder.Save(stream);
-
-                UpdateProgress(count++);
-            }
+                return bmp;
+            });
         }
 
         private void ShadowAsync(ShadowViewModel model)
@@ -6035,14 +5954,11 @@ namespace ScreenToGif.Windows
             var scale = Math.Round(ZoomBoxControl.ImageDpi / 96d, 2); //ZoomBoxControl.ImageScale;
             var blur = model.BlurRadius * ZoomBoxControl.ScaleDiff;
             var depth = model.Depth * ZoomBoxControl.ScaleDiff;
+            var imageDpi = ZoomBoxControl.ImageDpi;
+            var scaleDiff = ZoomBoxControl.ScaleDiff;
 
-            var count = 0;
-            foreach (var frame in Project.Frames)
+            EditFramesInParallel(Project.Frames, (frameInfo, image) =>
             {
-                if (_abortLoading)
-                    return;
-
-                var image = frame.Path.SourceFrom();
                 var drawingVisual = new DrawingVisual();
 
                 //Sizes:
@@ -6052,10 +5968,10 @@ namespace ScreenToGif.Windows
                 drawingVisual.Effect = new DropShadowEffect
                 {
                     Color = model.Color,
-                    BlurRadius = model.BlurRadius * ZoomBoxControl.ScaleDiff,
+                    BlurRadius = model.BlurRadius * scaleDiff,
                     Opacity = model.Opacity,
                     Direction = model.Direction,
-                    ShadowDepth = model.Depth * ZoomBoxControl.ScaleDiff,
+                    ShadowDepth = model.Depth * scaleDiff,
                     RenderingBias = RenderingBias.Quality
                 };
 
@@ -6114,7 +6030,7 @@ namespace ScreenToGif.Windows
                 }
 
                 //Converts the Visual (DrawingVisual) into a BitmapSource.
-                var innerBmp = new RenderTargetBitmap(frameWidth, frameHeight, ZoomBoxControl.ImageDpi, ZoomBoxControl.ImageDpi, PixelFormats.Pbgra32);
+                var innerBmp = new RenderTargetBitmap(frameWidth, frameHeight, imageDpi, imageDpi, PixelFormats.Pbgra32);
                 innerBmp.Render(drawingVisual);
 
                 //Draws background and rendered image on top.
@@ -6132,16 +6048,8 @@ namespace ScreenToGif.Windows
                 var bmp = new RenderTargetBitmap(frameWidth, frameHeight, image.DpiX, image.DpiY, PixelFormats.Pbgra32);
                 bmp.Render(drawingVisual);
 
-                //Creates a PngBitmapEncoder and adds the BitmapSource to the frames of the encoder.
-                var encoder = new PngBitmapEncoder();
-                encoder.Frames.Add(BitmapFrame.Create(bmp));
-
-                //Saves the image into a file using the encoder.
-                using (Stream stream = File.Create(frame.Path))
-                    encoder.Save(stream);
-
-                UpdateProgress(count++);
-            }
+                return bmp;
+            });
         }
 
         private void FlipRotate(FlipRotateType type)
@@ -6152,13 +6060,9 @@ namespace ScreenToGif.Windows
 
             Dispatcher.Invoke(() => IsLoading = true);
 
-            var count = 0;
-            foreach (var frame in frameList)
+            EditFramesInParallel(frameList, (frame, image) =>
             {
-                var image = frame.Path.SourceFrom();
-
                 Transform transform = null;
-
                 switch (type)
                 {
                     case FlipRotateType.FlipVertical:
@@ -6178,18 +6082,8 @@ namespace ScreenToGif.Windows
                         break;
                 }
 
-                var transBitmap = new TransformedBitmap(image, transform);
-
-                // Creates a PngBitmapEncoder and adds the BitmapSource to the frames of the encoder
-                var encoder = new PngBitmapEncoder();
-                encoder.Frames.Add(BitmapFrame.Create(transBitmap));
-
-                // Saves the image into a file using the encoder
-                using (Stream stream = File.Create(frame.Path))
-                    encoder.Save(stream);
-
-                UpdateProgress(count++);
-            }
+                return new TransformedBitmap(image, transform);
+            });
         }
 
         private void ReduceFrameCount(List<int> selection, int factor, int removeCount, ReduceDelayModes mode)
@@ -6429,7 +6323,7 @@ namespace ScreenToGif.Windows
             var count = 0;
             foreach (var frameInfo in frameList)
             {
-                if (_abortLoading)
+                if (_loadingCancelTokenSource.IsCancellationRequested)
                     return;
 
                 switch (model.Type)
@@ -6630,10 +6524,8 @@ namespace ScreenToGif.Windows
 
             rect = rect.Scale(screenScale).Limit(size.Width, size.Height);
 
-            var count = 0;
-            foreach (var frame in frameList)
+            EditFramesInParallel(frameList, (frameInfo, image) =>
             {
-                var image = frame.Path.SourceFrom();
                 BitmapSource render;
 
                 switch (UserSettings.All.ObfuscationMode)
@@ -6664,18 +6556,83 @@ namespace ScreenToGif.Windows
                     }
                 }
 
+                return render;
+            });
+
+            return selectedList;
+        }
+
+        private void EditFramesInParallel(List<FrameInfo> frames, Func<FrameInfo, BitmapSource> editAction)
+        {
+            var auxList = frames.CopyList();
+
+            const int maxMemoryPercentage = 50;
+            const int maxCpuPercentage = 75;
+            const int maxCpuCount = 256;
+
+            var memoryInfo = GC.GetGCMemoryInfo();
+            var bytesAvailable = memoryInfo.HighMemoryLoadThresholdBytes - memoryInfo.MemoryLoadBytes;
+            var bytesPerRawFrame = Project.BitsPerRawFrame / 8;
+            var framebuffersAvailable = (int)Math.Min(bytesAvailable / bytesPerRawFrame, int.MaxValue);
+            var maxMemoryDegreeOfParallelism = framebuffersAvailable * maxMemoryPercentage / 100;
+
+            var maxCpuDegreeOfParallelism = Math.Min(Environment.ProcessorCount * maxCpuPercentage / 100, maxCpuCount);
+            var maxDegreeOfParallelism = Math.Max(Math.Min(maxCpuDegreeOfParallelism, maxMemoryDegreeOfParallelism), 1);
+
+            int framesDone = 0;
+            auxList.AsParallel().WithDegreeOfParallelism(maxDegreeOfParallelism).WithCancellation(_loadingCancelTokenSource.Token).ForAll(frame =>
+            {
+                if (_loadingCancelTokenSource.IsCancellationRequested)
+                    return;
+
+                var bmp = editAction(frame);
+
                 //Creates a PngBitmapEncoder and adds the BitmapSource to the frames of the encoder.
                 var encoder = new PngBitmapEncoder();
-                encoder.Frames.Add(BitmapFrame.Create(render));
+                encoder.Frames.Add(BitmapFrame.Create(bmp));
+
+                if (_loadingCancelTokenSource.IsCancellationRequested)
+                    return;
 
                 //Saves the image into a file using the encoder.
                 using (Stream stream = File.Create(frame.Path))
                     encoder.Save(stream);
 
-                UpdateProgress(count++);
-            }
+                int curFramesDone = Interlocked.Increment(ref framesDone);
+                UpdateProgress(curFramesDone);
+            });
 
-            return selectedList;
+            GC.WaitForPendingFinalizers();
+            GC.Collect(1);
+        }
+
+        private void EditFramesInParallel(List<FrameInfo> frames, Func<FrameInfo, BitmapSource, BitmapSource> editAction)
+        {
+            EditFramesInParallel(frames, frame =>
+            {
+                return editAction(frame, frame.Path.SourceFrom());
+            });
+        }
+
+        private void EditFramesInParallel(List<FrameInfo> frames, Func<FrameInfo, DrawingContext, BitmapSource, bool> editAction)
+        {
+            EditFramesInParallel(frames, (frame, image) =>
+            {
+                var drawingVisual = new DrawingVisual();
+                using (var drawingContext = drawingVisual.RenderOpen())
+                {
+                    bool wasModified = editAction(frame, drawingContext, image);
+                    if (!wasModified)
+                    {
+                        return image;
+                    }
+                }
+
+                //Converts the Visual (DrawingVisual) into a BitmapSource.
+                var bmp = new RenderTargetBitmap(image.PixelWidth, image.PixelHeight, image.DpiX, image.DpiY, PixelFormats.Pbgra32);
+                bmp.Render(drawingVisual);
+                return bmp;
+            });
         }
 
         private void MouseEventsAsync(MouseEventsViewModel model)
@@ -6686,8 +6643,6 @@ namespace ScreenToGif.Windows
             });
 
             ShowProgress(LocalizationHelper.Get("S.Editor.ApplyingOverlay"), Project.Frames.Count);
-
-            var auxList = Project.Frames.CopyList();
 
             // Initialize brushes.
             var brushesByMouseButton = new Dictionary<MouseButtons, SolidColorBrush>();
@@ -6734,48 +6689,22 @@ namespace ScreenToGif.Windows
                 brushesByMouseButton.Add(MouseButtons.SecondExtra, brush);
             }
 
-            var count = 0;
-            foreach (var frame in auxList)
+            EditFramesInParallel(Project.Frames, (frame, drawingContext, image) =>
             {
-                if (_abortLoading)
-                    return;
-
-                if (frame.ButtonClicked == MouseButtons.None || frame.CursorX == int.MinValue)
-                {
-                    UpdateProgress(count++);
-                }
+                bool wasModified = false;
 
                 if (!brushesByMouseButton.TryGetValue(frame.ButtonClicked, out var brush))
                 {
-                    continue;
+                    return wasModified;
                 }
 
-                var image = frame.Path.SourceFrom();
+                wasModified = true;
+                drawingContext.DrawImage(image, new Rect(0, 0, image.Width, image.Height));
                 var scale = Math.Round(image.DpiX / 96d, 2);
-                var drawingVisual = new DrawingVisual();
-                using (var drawingContext = drawingVisual.RenderOpen())
-                {
-                    drawingContext.DrawImage(image, new Rect(0, 0, image.Width, image.Height));
-                    drawingContext.DrawEllipse(brush, null, new Point(frame.CursorX / scale, frame.CursorY / scale), model.Width, model.Height);
-                }
+                drawingContext.DrawEllipse(brush, null, new Point(frame.CursorX / scale, frame.CursorY / scale), model.Width, model.Height);
 
-                //Converts the Visual (DrawingVisual) into a BitmapSource.
-                var bmp = new RenderTargetBitmap(image.PixelWidth, image.PixelHeight, image.DpiX, image.DpiY, PixelFormats.Pbgra32);
-                bmp.Render(drawingVisual);
-
-                //Creates a PngBitmapEncoder and adds the BitmapSource to the frames of the encoder.
-                var encoder = new PngBitmapEncoder();
-                encoder.Frames.Add(BitmapFrame.Create(bmp));
-
-                //Saves the image into a file using the encoder.
-                using (Stream stream = File.Create(frame.Path))
-                    encoder.Save(stream);
-
-                GC.WaitForPendingFinalizers();
-                GC.Collect(1);
-
-                UpdateProgress(count++);
-            }
+                return wasModified;
+            });
         }
 
         #endregion

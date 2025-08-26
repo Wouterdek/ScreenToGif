@@ -74,6 +74,10 @@ public class ProjectInfo
     [DataMember(Order = 8)]
     public int BitDepth { get; set; } = 32;
 
+    /// <summary>
+    /// Number of bits for one uncompressed frame.
+    /// </summary>
+    public int BitsPerRawFrame => Width * Height * BitDepth;
 
     /// <summary>
     /// The full path of project based on current settings.
